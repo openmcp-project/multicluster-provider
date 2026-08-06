@@ -1,4 +1,8 @@
-# OpenControlPlane Repository Template
+# Multicluster-Runtime Provider
+
+This repo contains an implementation of [multicluster-runtime](https://github.com/kubernetes-sigs/multicluster-runtime)'s `Provider` interface which is compatible with the [open-control-plane cluster API](https://github.com/openmcp-project/openmcp-operator/blob/main/api/clusters/v1alpha1/cluster_types.go).
+
+Its implementation is inspired by the [Gardener equivalent](https://github.com/gardener/multicluster-provider).
 
 ## Support, Feedback, Contributing
 
