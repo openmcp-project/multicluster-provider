@@ -27,6 +27,8 @@ import (
 	"github.com/openmcp-project/controller-utils/pkg/logging"
 	clustersv1alpha1 "github.com/openmcp-project/openmcp-operator/api/clusters/v1alpha1"
 	commonapi "github.com/openmcp-project/openmcp-operator/api/common"
+
+	clusterctrl "github.com/openmcp-project/multicluster-provider/pkg/cluster"
 )
 
 const (
@@ -72,8 +74,10 @@ type ClusterInstance struct {
 
 // New creates a new Provider instance.
 // platformClient is the client for the platform cluster.
-// id must be an identifier which is unique among all instances of this provider running against the same platform cluster. It is recommended to use the importing controller's provider name or something similar.
-// arTokenConfig specifies the permissions that the returned clients will have for every cluster.
+// scheme is the scheme which will be used for the clients retrieved from the provider
+// opts allows to set various options, most prominently, the label selector for AccessRequests which must be set, otherwise the provider will not engage any clusters.
+//
+// It is recommended to use NewWithClusterController instead, which will automatically wire the provider to a controller which creates the AccessRequests and allows to react to cluster lifecycle events.
 func New(platformClient client.Client, scheme *runtime.Scheme, opts ...Option) *Provider {
 	p := &Provider{
 		opts:           &Options{},
@@ -89,6 +93,24 @@ func New(platformClient client.Client, scheme *runtime.Scheme, opts ...Option) *
 	}
 
 	return p
+}
+
+// NewWithClusterController combines the creation of a new Provider with a controller managing AccessRequests for clusters, which is required for the provider to work anyway.
+// In addition, the cluster controller can also execute custom logic via the given handler.
+// The provider will automatically be configured with the correct label selector to watch AccessRequests created by the cluster controller.
+// DO NOT CHANGE THE LABEL SELECTOR, otherwise you risk breaking the wiring between provider and cluster controller.
+
+// Arguments:
+// - platformClient: The client for the platform cluster.
+// - providerName: This must be a k8s label value compliant string, and it must be unique across all operators using this library in the same platform cluster. It is recommended to use the PlatformService (or ServiceProvider)'s name for this.
+// - scheme: The scheme used for the clients retrieved from the provider.
+// - tokenConfig: The configuration for the kubeconfig token to be used for the AccessRequests created by the cluster controller.
+// - handler: A custom handler which will be called on cluster lifecycle events (engage/disengage). If not desired, putting in an empty cluster.Funcs{} struct works as a no-op handler.
+func NewWithClusterController(platformClient client.Client, providerName string, scheme *runtime.Scheme, tokenConfig *clustersv1alpha1.TokenConfig, handler clusterctrl.ClusterHandler, opts ...Option) (*Provider, *clusterctrl.ClusterController) {
+	opts = append(opts, WithAccessRequestSelectors(clusterctrl.LabelSelectorForProvider(providerName)))
+	prov := New(platformClient, scheme, opts...)
+	cctrl := clusterctrl.NewClusterController(platformClient, handler, prov, providerName, tokenConfig)
+	return prov, cctrl
 }
 
 // SetupWithManager sets up the controller with the Manager.
