@@ -36,10 +36,10 @@ const (
 )
 
 type ClusterController struct {
-	platformClient client.Client
-	Handler        ClusterHandler
-	car            clusteraccess.ClusterAccessReconciler
-	prov           multicluster.Provider // uses the interface to avoid import cycles, but this must be the provider implementation from this repo
+	platformCluster cluster.Cluster
+	Handler         ClusterHandler
+	car             clusteraccess.ClusterAccessReconciler
+	prov            multicluster.Provider // uses the interface to avoid import cycles, but this must be the provider implementation from this repo
 }
 
 var _ mcreconcile.Reconciler = &ClusterController{}
@@ -52,11 +52,11 @@ var _ mcreconcile.Reconciler = &ClusterController{}
 // The returned controller must be registered with a multicluster manager (working on the platform cluster) using its SetupWithMulticlusterManager method.
 //
 // It is recommended to use the NewWithClusterController constructor in the provider package instead, which creates provider and controller together.
-func NewClusterController(platformClient client.Client, handler ClusterHandler, prov multicluster.Provider, providerName string, tokenConfig *clustersv1alpha1.TokenConfig) *ClusterController {
+func NewClusterController(platformCluster cluster.Cluster, handler ClusterHandler, prov multicluster.Provider, providerName string, tokenConfig *clustersv1alpha1.TokenConfig) *ClusterController {
 	res := &ClusterController{
-		platformClient: platformClient,
-		Handler:        handler,
-		car: clusteraccess.NewClusterAccessReconciler(platformClient, providerName).WithManagedLabels(func(controllerName string, req reconcile.Request, reg clusteraccess.ClusterRegistration) (string, string, map[string]string) {
+		platformCluster: platformCluster,
+		Handler:         handler,
+		car: clusteraccess.NewClusterAccessReconciler(platformCluster.GetClient(), providerName).WithManagedLabels(func(controllerName string, req reconcile.Request, reg clusteraccess.ClusterRegistration) (string, string, map[string]string) {
 			managedBy, managedPurpose, additionalLabels := clusteraccess.DefaultManagedLabelGenerator(controllerName, req, reg)
 			if additionalLabels == nil {
 				additionalLabels = map[string]string{}
@@ -98,7 +98,7 @@ func (cc *ClusterController) reconcile(ctx context.Context, req mcreconcile.Requ
 	cl := &clustersv1alpha1.Cluster{}
 	cl.Name = req.Name
 	cl.Namespace = req.Namespace
-	if err := cc.platformClient.Get(ctx, client.ObjectKeyFromObject(cl), cl); err != nil {
+	if err := cc.platformCluster.GetClient().Get(ctx, client.ObjectKeyFromObject(cl), cl); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return reconcile.Result{}, fmt.Errorf("error fetching cluster '%s': %w", req.String(), err)
 		}
@@ -179,7 +179,7 @@ func (cc *ClusterController) SetupWithMulticlusterManager(mgr mcmanager.Manager)
 func (cc *ClusterController) callIsResponsibleFor(ctx context.Context, req mcreconcile.Request, cluster *clustersv1alpha1.Cluster) bool {
 	log := logging.FromContextOrPanic(ctx)
 	log.Debug("Start: IsResponsibleFor")
-	res := cc.Handler.IsResponsibleFor(logging.NewContext(ctx, log.WithName(LogNameIsResponsibleFor)), req, cc.platformClient, cluster)
+	res := cc.Handler.IsResponsibleFor(logging.NewContext(ctx, log.WithName(LogNameIsResponsibleFor)), req, cc.platformCluster.GetClient(), cluster)
 	log.Debug("End: IsResponsibleFor", "result", res)
 	return res
 }
@@ -187,7 +187,7 @@ func (cc *ClusterController) callIsResponsibleFor(ctx context.Context, req mcrec
 func (cc *ClusterController) callHandleCreateOrUpdate(ctx context.Context, req mcreconcile.Request, cluster *clustersv1alpha1.Cluster, access cluster.Cluster) (reconcile.Result, error) {
 	log := logging.FromContextOrPanic(ctx)
 	log.Debug("Start: HandleCreateOrUpdate")
-	res, err := cc.Handler.HandleCreateOrUpdate(logging.NewContext(ctx, log.WithName(LogNameHandleCreateOrUpdate)), req, cc.platformClient, cluster, access)
+	res, err := cc.Handler.HandleCreateOrUpdate(logging.NewContext(ctx, log.WithName(LogNameHandleCreateOrUpdate)), req, cc.platformCluster.GetClient(), cluster, access)
 	log.Debug("End: HandleCreateOrUpdate", "requeueAfter", res.RequeueAfter, "error", err)
 	return res, err
 }
@@ -195,7 +195,7 @@ func (cc *ClusterController) callHandleCreateOrUpdate(ctx context.Context, req m
 func (cc *ClusterController) callHandleDelete(ctx context.Context, req mcreconcile.Request, cluster *clustersv1alpha1.Cluster, access cluster.Cluster) (reconcile.Result, error) {
 	log := logging.FromContextOrPanic(ctx)
 	log.Debug("Start: HandleDelete")
-	res, err := cc.Handler.HandleDelete(logging.NewContext(ctx, log.WithName(LogNameHandleDelete)), req, cc.platformClient, cluster, access)
+	res, err := cc.Handler.HandleDelete(logging.NewContext(ctx, log.WithName(LogNameHandleDelete)), req, cc.platformCluster.GetClient(), cluster, access)
 	log.Debug("End: HandleDelete", "requeueAfter", res.RequeueAfter, "error", err)
 	return res, err
 }
@@ -203,7 +203,7 @@ func (cc *ClusterController) callHandleDelete(ctx context.Context, req mcreconci
 func (cc *ClusterController) callAfterDeletion(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
 	log := logging.FromContextOrPanic(ctx)
 	log.Debug("Start: AfterDeletion")
-	res, err := cc.Handler.AfterDeletion(logging.NewContext(ctx, log.WithName(LogNameAfterDeletion)), req, cc.platformClient)
+	res, err := cc.Handler.AfterDeletion(logging.NewContext(ctx, log.WithName(LogNameAfterDeletion)), req, cc.platformCluster.GetClient())
 	log.Debug("End: AfterDeletion", "requeueAfter", res.RequeueAfter, "error", err)
 	return res, err
 }
