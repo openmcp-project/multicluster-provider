@@ -17,6 +17,9 @@ const (
 	// The main difference between both cases is that the former case will use the permissions of the serviceaccount under which the provider itself is running,
 	// whereas the latter case will use the permissions from the AccessRequest for the platform Cluster resource.
 	HostingPlatformCluster multicluster.ClusterName = ""
+
+	// ReasonClusterAccessError is a reason which can be used to indicate problems with getting access from the provider.
+	ReasonClusterAccessError = "ClusterAccessError"
 )
 
 // ClusterName returns the multicluster.ClusterName for a given namespace and name.
