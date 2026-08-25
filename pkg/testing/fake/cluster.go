@@ -37,6 +37,14 @@ func WithClientBuilder(b *fakeclient.ClientBuilder) ClusterOption {
 	}
 }
 
+// WithClient allows to set a custom client for the Cluster.
+// Incompatible with WithClientBuilder.
+func WithClient(cl client.Client) ClusterOption {
+	return func(c *Cluster) {
+		c.client = cl
+	}
+}
+
 // NewCluster creates a fake Cluster backed by a fake client and an in-memory
 // cache. Use ClusterOption to customise it further.
 func NewCluster(scheme *runtime.Scheme, opts ...ClusterOption) *Cluster {
