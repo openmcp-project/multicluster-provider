@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	mcclusters "sigs.k8s.io/multicluster-runtime/pkg/clusters"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 
 	ctrlutils "github.com/openmcp-project/controller-utils/pkg/controller"
@@ -44,11 +45,11 @@ type Provider struct {
 	opts            *Options
 	platformCluster cluster.Cluster
 
+	clusters mcclusters.Clusters[*ClusterInstance]
+
 	lock                      sync.RWMutex
 	mcAware                   multicluster.Aware
 	accessRequests            map[reconcile.Request]commonapi.ObjectReference // maps AccessRequests to their cluster reference, is kept in sync with clusters (required to remove clusters from deleted AccessRequests)
-	clusters                  map[multicluster.ClusterName]*ClusterInstance
-	indexers                  []index
 	scheme                    *runtime.Scheme
 	hostingPlatformClusterRef *commonapi.ObjectReference // reference to the cluster which is the hosting platform cluster, if any
 }
@@ -57,17 +58,10 @@ var _ multicluster.Provider = &Provider{}
 var _ multicluster.ProviderRunnable = &Provider{}
 var _ reconcile.Reconciler = &Provider{}
 
-type index struct {
-	object       client.Object
-	field        string
-	extractValue client.IndexerFunc
-}
-
 type ClusterInstance struct {
 	cluster.Cluster
 	AccessRequest *clustersv1alpha1.AccessRequest
 	Kubeconfig    []byte
-	disengage     context.CancelFunc
 }
 
 ///////////
@@ -85,8 +79,7 @@ func New(platformCluster cluster.Cluster, scheme *runtime.Scheme, opts ...Option
 		opts:            &Options{},
 		platformCluster: platformCluster,
 		accessRequests:  map[reconcile.Request]commonapi.ObjectReference{},
-		clusters:        map[multicluster.ClusterName]*ClusterInstance{},
-		indexers:        []index{},
+		clusters:        mcclusters.New[*ClusterInstance](),
 		scheme:          scheme,
 	}
 
@@ -183,33 +176,12 @@ func (p *Provider) Get(ctx context.Context, clusterName multicluster.ClusterName
 			return p.platformCluster, nil
 		}
 	}
-	if cl, ok := p.clusters[clusterName]; ok {
-		return cl.Cluster, nil
-	}
-
-	return nil, fmt.Errorf("cluster '%s' not found", clusterName.String())
+	return p.clusters.Get(ctx, clusterName)
 }
 
 // IndexField implements [multicluster.Provider].
 func (p *Provider) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	// save for future clusters
-	p.indexers = append(p.indexers, index{
-		object:       obj,
-		field:        field,
-		extractValue: extractValue,
-	})
-
-	// apply to known clusters
-	for key, ci := range p.clusters {
-		if err := ci.Cluster.GetCache().IndexField(ctx, obj, field, extractValue); err != nil {
-			return fmt.Errorf("failed to index field '%s' on Cluster '%s': %w", field, key.String(), err)
-		}
-	}
-
-	return nil
+	return p.clusters.IndexField(ctx, obj, field, extractValue)
 }
 
 ///////////////////////////////////////////////
@@ -225,7 +197,10 @@ func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
 	p.mcAware = aware
 	p.lock.Unlock()
 
-	<-ctx.Done()
+	err := p.platformCluster.Start(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start platform cluster: %w", err)
+	}
 
 	log.Info("Stopping provider")
 	return nil
@@ -259,7 +234,11 @@ func (p *Provider) reconcile(ctx context.Context, req reconcile.Request) (reconc
 	cRef, isEngaged := p.accessRequests[req]
 	var ci *ClusterInstance
 	if isEngaged {
-		ci = p.clusters[ClusterNameFromReference(&cRef)]
+		var err error
+		ci, err = p.clusters.GetTyped(ctx, ClusterNameFromReference(&cRef))
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("internal state inconsistency: AccessRequest in internal map, but corresponding cluster is not, this is not supposed to happen: %w", err)
+		}
 		log = log.WithValues("clusterName", cRef.Name, "clusterNamespace", cRef.Namespace)
 		ctx = logging.NewContext(ctx, log)
 	}
@@ -342,28 +321,18 @@ func (p *Provider) reconcile(ctx context.Context, req reconcile.Request) (reconc
 	}
 
 	log.Info("Engaging cluster")
-	log.Debug("Adding indexers")
-	p.lock.Lock() // we don't want any new indexers to be added until we have engaged the cluster, otherwise they will be lost
+	p.lock.Lock()
 	defer p.lock.Unlock()
-	for _, indexer := range p.indexers {
-		if err := cl.GetCache().IndexField(ctx, indexer.object, indexer.field, indexer.extractValue); err != nil {
-			return reconcile.Result{}, fmt.Errorf("failed to index field '%s' on Cluster '%s/%s': %w", indexer.field, cRef.Namespace, cRef.Name, err)
-		}
-	}
 
-	cCtx, cancel := context.WithCancel(ctx)
 	ci = &ClusterInstance{
 		Cluster:       cl,
 		AccessRequest: ar,
-		disengage:     cancel,
 	}
 
-	if err := p.mcAware.Engage(cCtx, ClusterNameFromReference(&cRef), cl); err != nil {
-		cancel()
+	p.accessRequests[req] = cRef
+	if err := p.clusters.AddOrReplace(ctx, ClusterNameFromReference(&cRef), ci, p.mcAware); err != nil {
 		return reconcile.Result{}, fmt.Errorf("failed to engage cluster '%s/%s': %w", cRef.Namespace, cRef.Name, err)
 	}
-	p.accessRequests[req] = cRef
-	p.clusters[ClusterNameFromReference(&cRef)] = ci
 	log.Debug("Cluster successfully engaged")
 
 	if slices.Contains(clu.Spec.Purposes, clustersv1alpha1.PURPOSE_PLATFORM) && cl.GetConfig().Host == p.platformCluster.GetConfig().Host {
@@ -385,16 +354,11 @@ func (p *Provider) disengage(log logging.Logger, arReq reconcile.Request) {
 	defer p.lock.Unlock()
 	cRef, ok := p.accessRequests[arReq]
 	if !ok {
-		log.Debug("Cluster not engaged, nothing to do")
+		log.Debug("Cluster not engaged, nothing to do (trying to remove it anyway, just in case)")
 		return
 	}
-	ci, ok := p.clusters[ClusterNameFromReference(&cRef)]
-	if !ok {
-		log.Error(nil, "Internal state inconsistency: AccessRequest in internal map, but corresponding cluster is not, this is not supposed to happen")
-	} else {
-		ci.disengage()
-		delete(p.clusters, ClusterNameFromReference(&cRef))
-	}
+
+	p.clusters.Remove(ClusterNameFromReference(&cRef))
 	delete(p.accessRequests, arReq)
 	if p.hostingPlatformClusterRef != nil && p.hostingPlatformClusterRef.Namespace == cRef.Namespace && p.hostingPlatformClusterRef.Name == cRef.Name {
 		log.Info("Hosting platform cluster has been disengaged")
