@@ -27,7 +27,50 @@ This is solved via the list of label selectors, which can be passed into the pro
 
 ### Recommended Setup
 
-WIP
+The easiest way to consume the provider is to initialize it in combination with a cluster controller:
+```go
+  import (
+    "github.com/openmcp-project/multicluster-provider/pkg/provider"
+    clusterhandler "github.com/openmcp-project/multicluster-provider/pkg/cluster"
+  )
+
+  ...
+
+  prov, cctrl := provider.NewWithClusterController(
+    platformCluster,
+    providerName,
+    scheme,
+    &clustersv1alpha1.TokenConfig{ // adapt to required permissions
+      Permissions: []clustersv1alpha1.PermissionsRequest{
+        {
+          Rules: []rbacv1.PolicyRule{
+            {
+              APIGroups: []string{"*"},
+              Resources: []string{"*"},
+              Verbs:     []string{"*"},
+            },
+          },
+        },
+      },
+    },
+    clusterhandler.Funcs{
+      IsResponsibleForFunc: ..., // cluster selector
+      HandleCreateOrUpdateFunc: ..., // what to do on create/update
+      HandleDeleteFunc: ..., // what to do on delete
+      AfterDeletionFunc: ..., // what to do after the cluster is gone
+    },
+  )
+
+  mgr, err := mcmanager.New(platformCluster.RESTConfig(), prov, ...)
+  if err != nil {
+    return fmt.Errorf("unable to create manager: %w", err)
+  }
+  if err := cctrl.SetupWithMulticlusterManager(mgr); err != nil {
+    return fmt.Errorf("unable to setup multicluster Cluster controller with manager: %w", err)
+  }
+```
+
+This approach not only creates a controller that watches `Cluster` resources and creates `AccessRequests` for it and wires it to the provider, but it also allows to inject own logic into the cluster controller via the given cluster handler (last argument of the constructor). If no custom logic is required in the cluster controller, simply use an empty `clusterhandler.Funcs` object.
 
 ## Support, Feedback, Contributing
 
