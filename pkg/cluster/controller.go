@@ -172,7 +172,7 @@ func (cc *ClusterController) SetupWithMulticlusterManager(mgr mcmanager.Manager)
 				predicate.LabelChangedPredicate{},
 				ctrlutils.DeletionTimestampChangedPredicate{},
 			),
-		)).
+		), mcbuilder.WithEngageWithLocalCluster(true)).
 		Complete(cc)
 }
 

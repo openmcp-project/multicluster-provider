@@ -68,6 +68,9 @@ The easiest way to consume the provider is to initialize it in combination with 
   if err := cctrl.SetupWithMulticlusterManager(mgr); err != nil {
     return fmt.Errorf("unable to setup multicluster Cluster controller with manager: %w", err)
   }
+	if err := prov.SetupWithManager(mgr.GetLocalManager()); err != nil {
+		return fmt.Errorf("unable to setup multicluster provider with manager: %w", err)
+	}
 ```
 
 This approach not only creates a controller that watches `Cluster` resources and creates `AccessRequests` for it and wires it to the provider, but it also allows to inject own logic into the cluster controller via the given cluster handler (last argument of the constructor). If no custom logic is required in the cluster controller, simply use an empty `clusterhandler.Funcs` object.
