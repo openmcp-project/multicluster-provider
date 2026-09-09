@@ -190,7 +190,8 @@ func (p *Provider) IndexField(ctx context.Context, obj client.Object, field stri
 
 // Start implements [multicluster.ProviderRunnable].
 func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
-	log := logging.FromContextOrDiscard(ctx).WithName(ProviderName)
+	log, ctx := logging.FromContextOrNew(ctx, nil)
+	log = log.WithName(ProviderName)
 	log.Info("Starting provider")
 
 	p.lock.Lock()
