@@ -332,6 +332,8 @@ func (p *Provider) reconcile(ctx context.Context, req reconcile.Request) (reconc
 
 	p.accessRequests[req] = cRef
 	if err := p.clusters.AddOrReplace(ctx, ClusterNameFromReference(&cRef), ci, p.mcAware); err != nil {
+		// any error returned by AddOrReplace comes from an Add operation, so we can safely remove the access request from the map if that failed
+		delete(p.accessRequests, req)
 		return reconcile.Result{}, fmt.Errorf("failed to engage cluster '%s/%s': %w", cRef.Namespace, cRef.Name, err)
 	}
 	log.Debug("Cluster successfully engaged")
