@@ -30,13 +30,13 @@ This is solved via the list of label selectors, which can be passed into the pro
 The easiest way to consume the provider is to initialize it in combination with a cluster controller:
 ```go
   import (
-    "github.com/openmcp-project/multicluster-provider/pkg/provider"
     clusterhandler "github.com/openmcp-project/multicluster-provider/pkg/cluster"
+  	providersetup "github.com/openmcp-project/multicluster-provider/pkg/setup"
   )
 
   ...
 
-  prov, cctrl := provider.NewWithClusterController(
+  prov, cctrl := providersetup.NewWithClusterController(
     platformCluster,
     providerName,
     scheme,
@@ -65,9 +65,9 @@ The easiest way to consume the provider is to initialize it in combination with 
   if err != nil {
     return fmt.Errorf("unable to create manager: %w", err)
   }
-  if err := cctrl.SetupWithMulticlusterManager(mgr); err != nil {
-    return fmt.Errorf("unable to setup multicluster Cluster controller with manager: %w", err)
-  }
+	if err := cctrl.SetupWithManager(mgr.GetLocalManager()); err != nil {
+		return fmt.Errorf("unable to setup multicluster Cluster controller with manager: %w", err)
+	}
 	if err := prov.SetupWithManager(mgr.GetLocalManager()); err != nil {
 		return fmt.Errorf("unable to setup multicluster provider with manager: %w", err)
 	}
