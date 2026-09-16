@@ -20,6 +20,9 @@ const (
 
 	// ReasonClusterAccessError is a reason which can be used to indicate problems with getting access from the provider.
 	ReasonClusterAccessError = "ClusterAccessError"
+
+	// MulticlusterPrefix is a prefix which can be used for annotations, labels, and/or finalizers.
+	MulticlusterPrefix = "multicluster.open-control-plane.io/"
 )
 
 // ClusterName returns the multicluster.ClusterName for a given namespace and name.
@@ -47,4 +50,9 @@ func ClusterNameFromCluster(cluster *clustersv1alpha1.Cluster) multicluster.Clus
 		return ClusterName("", "")
 	}
 	return ClusterName(cluster.Namespace, cluster.Name)
+}
+
+// ClusterFinalizer returns the finalizer to put on Cluster resources.
+func ClusterFinalizer(providerName string) string {
+	return MulticlusterPrefix + providerName
 }

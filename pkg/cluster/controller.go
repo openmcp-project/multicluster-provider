@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -17,9 +18,10 @@ import (
 
 	ctrlutils "github.com/openmcp-project/controller-utils/pkg/controller"
 	"github.com/openmcp-project/controller-utils/pkg/logging"
-	"github.com/openmcp-project/multicluster-provider/pkg/utils"
 	clustersv1alpha1 "github.com/openmcp-project/openmcp-operator/api/clusters/v1alpha1"
 	clusteraccess "github.com/openmcp-project/openmcp-operator/lib/clusteraccess/advanced"
+
+	"github.com/openmcp-project/multicluster-provider/pkg/utils"
 )
 
 const (
@@ -32,7 +34,7 @@ const (
 
 	clusterKey = "mcaccess"
 
-	MulticlusterIDLabelKey = "multicluster.open-control-plane.io/id"
+	MulticlusterIDLabelKey = utils.MulticlusterPrefix + "id"
 )
 
 type ClusterController struct {
@@ -40,6 +42,7 @@ type ClusterController struct {
 	Handler         ClusterHandler
 	car             clusteraccess.ClusterAccessReconciler
 	prov            multicluster.Provider // uses the interface to avoid import cycles, but this must be the provider implementation from this repo
+	providerName    string
 }
 
 var _ reconcile.Reconciler = &ClusterController{}
@@ -64,7 +67,8 @@ func NewClusterController(platformCluster cluster.Cluster, handler ClusterHandle
 			additionalLabels[MulticlusterIDLabelKey] = providerName
 			return managedBy, managedPurpose, additionalLabels
 		}),
-		prov: prov,
+		prov:         prov,
+		providerName: providerName,
 	}
 	res.car.Register(clusteraccess.ExistingCluster(clusterKey, "", clusteraccess.IdentityReferenceGenerator).
 		WithNamespaceGenerator(clusteraccess.RequestNamespaceGenerator).
@@ -113,11 +117,25 @@ func (cc *ClusterController) reconcile(ctx context.Context, req reconcile.Reques
 		_, err := cc.car.AccessRequest(ctx, standardRequestFromMulticlusterRequest(req), clusterKey)
 		if apierrors.IsNotFound(err) {
 			// There is no AccessRequest for this Cluster, so it was not handled before (or has already been 'unhandled'), so we do nothing.
-			log.Debug("No AccessRequest found for cluster, nothing to do")
+			log.Debug("No AccessRequest found for cluster, nothing to do except for making sure that the finalizer is gone")
+			old := cl.DeepCopy()
+			if controllerutil.RemoveFinalizer(cl, utils.ClusterFinalizer(cc.providerName)) {
+				if err := cc.platformCluster.GetClient().Patch(ctx, cl, client.MergeFrom(old)); err != nil {
+					return reconcile.Result{}, fmt.Errorf("error removing finalizer from cluster '%s': %w", req.String(), err)
+				}
+			}
 			return reconcile.Result{}, nil
 		}
 
 		log.Debug("Found an AccessRequest for the cluster, running deletion logic")
+	} else {
+		// ensure finalizer on cluster
+		old := cl.DeepCopy()
+		if controllerutil.AddFinalizer(cl, utils.ClusterFinalizer(cc.providerName)) {
+			if err := cc.platformCluster.GetClient().Patch(ctx, cl, client.MergeFrom(old)); err != nil {
+				return reconcile.Result{}, fmt.Errorf("error adding finalizer to cluster '%s': %w", req.String(), err)
+			}
+		}
 	}
 
 	log.Debug("Reconciling cluster access")
@@ -154,6 +172,14 @@ func (cc *ClusterController) reconcile(ctx context.Context, req reconcile.Reques
 		}
 		if res.RequeueAfter > 0 {
 			return res, nil
+		}
+
+		// remove finalizer
+		old := cl.DeepCopy()
+		if controllerutil.RemoveFinalizer(cl, utils.ClusterFinalizer(cc.providerName)) {
+			if err := cc.platformCluster.GetClient().Patch(ctx, cl, client.MergeFrom(old)); err != nil {
+				return reconcile.Result{}, fmt.Errorf("error removing finalizer from cluster '%s': %w", req.String(), err)
+			}
 		}
 
 		res, err = cc.callAfterDeletion(ctx, req)
