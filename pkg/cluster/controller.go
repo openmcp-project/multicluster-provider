@@ -7,19 +7,21 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
-	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
-	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	ctrlutils "github.com/openmcp-project/controller-utils/pkg/controller"
 	"github.com/openmcp-project/controller-utils/pkg/logging"
 	clustersv1alpha1 "github.com/openmcp-project/openmcp-operator/api/clusters/v1alpha1"
 	clusteraccess "github.com/openmcp-project/openmcp-operator/lib/clusteraccess/advanced"
+
+	"github.com/openmcp-project/multicluster-provider/pkg/utils"
 )
 
 const (
@@ -32,7 +34,7 @@ const (
 
 	clusterKey = "mcaccess"
 
-	MulticlusterIDLabelKey = "multicluster.open-control-plane.io/id"
+	MulticlusterIDLabelKey = utils.MulticlusterPrefix + "id"
 )
 
 type ClusterController struct {
@@ -40,18 +42,19 @@ type ClusterController struct {
 	Handler         ClusterHandler
 	car             clusteraccess.ClusterAccessReconciler
 	prov            multicluster.Provider // uses the interface to avoid import cycles, but this must be the provider implementation from this repo
+	providerName    string
 }
 
-var _ mcreconcile.Reconciler = &ClusterController{}
+var _ reconcile.Reconciler = &ClusterController{}
 
 // NewClusterController creates a new ClusterController.
 // The controller reconciles Cluster resources, manages access to them, and calls the given handler's methods at the appropriate times.
 // The given provider must be the provider implementation from this repo, and it must use the label selector returned by LabelSelectorForProvider(providerName) to select the clusters it manages.
 // The providerName argument must be unique among all operators in the same platform cluster using this controller. It must be valid to be used as a label value.
 //
-// The returned controller must be registered with a multicluster manager (working on the platform cluster) using its SetupWithMulticlusterManager method.
+// The returned controller must be registered with a manager (working on the platform cluster) using its SetupWithManager method.
 //
-// It is recommended to use the NewWithClusterController constructor in the provider package instead, which creates provider and controller together.
+// It is recommended to use the setup.NewWithClusterController constructor in the provider package instead, which creates provider and controller together.
 func NewClusterController(platformCluster cluster.Cluster, handler ClusterHandler, prov multicluster.Provider, providerName string, tokenConfig *clustersv1alpha1.TokenConfig) *ClusterController {
 	res := &ClusterController{
 		platformCluster: platformCluster,
@@ -64,7 +67,8 @@ func NewClusterController(platformCluster cluster.Cluster, handler ClusterHandle
 			additionalLabels[MulticlusterIDLabelKey] = providerName
 			return managedBy, managedPurpose, additionalLabels
 		}),
-		prov: prov,
+		prov:         prov,
+		providerName: providerName,
 	}
 	res.car.Register(clusteraccess.ExistingCluster(clusterKey, "", clusteraccess.IdentityReferenceGenerator).
 		WithNamespaceGenerator(clusteraccess.RequestNamespaceGenerator).
@@ -84,14 +88,14 @@ func LabelSelectorForProvider(providerName string) labels.Selector {
 	return sel.Add(*idReq)
 }
 
-func (cc *ClusterController) Reconcile(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
+func (cc *ClusterController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := logging.FromContextOrPanic(ctx).WithName(ControllerName)
 	ctx = logging.NewContext(ctx, log)
 	log.Info("Starting reconcile")
 	return cc.reconcile(ctx, req)
 }
 
-func (cc *ClusterController) reconcile(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
+func (cc *ClusterController) reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := logging.FromContextOrPanic(ctx)
 
 	// fetch cluster
@@ -110,25 +114,39 @@ func (cc *ClusterController) reconcile(ctx context.Context, req mcreconcile.Requ
 	isResponsible := cc.callIsResponsibleFor(ctx, req, cl)
 	if !isResponsible {
 		// somewhat ugly, but not possible any other way
-		_, err := cc.car.AccessRequest(ctx, standardRequestFromMulticlusterRequest(req), clusterKey)
+		_, err := cc.car.AccessRequest(ctx, req, clusterKey)
 		if apierrors.IsNotFound(err) {
 			// There is no AccessRequest for this Cluster, so it was not handled before (or has already been 'unhandled'), so we do nothing.
-			log.Debug("No AccessRequest found for cluster, nothing to do")
+			log.Debug("No AccessRequest found for cluster, nothing to do except for making sure that the finalizer is gone")
+			old := cl.DeepCopy()
+			if controllerutil.RemoveFinalizer(cl, utils.ClusterFinalizer(cc.providerName)) {
+				if err := cc.platformCluster.GetClient().Patch(ctx, cl, client.MergeFrom(old)); err != nil {
+					return reconcile.Result{}, fmt.Errorf("error removing finalizer from cluster '%s': %w", req.String(), err)
+				}
+			}
 			return reconcile.Result{}, nil
 		}
 
 		log.Debug("Found an AccessRequest for the cluster, running deletion logic")
+	} else {
+		// ensure finalizer on cluster
+		old := cl.DeepCopy()
+		if controllerutil.AddFinalizer(cl, utils.ClusterFinalizer(cc.providerName)) {
+			if err := cc.platformCluster.GetClient().Patch(ctx, cl, client.MergeFrom(old)); err != nil {
+				return reconcile.Result{}, fmt.Errorf("error adding finalizer to cluster '%s': %w", req.String(), err)
+			}
+		}
 	}
 
 	log.Debug("Reconciling cluster access")
-	res, err := cc.car.Reconcile(ctx, standardRequestFromMulticlusterRequest(req))
+	res, err := cc.car.Reconcile(ctx, req)
 	if err != nil {
 		return res, fmt.Errorf("error reconciling cluster access: %w", err)
 	}
 	if res.RequeueAfter > 0 {
 		return res, nil
 	}
-	access, err := cc.prov.Get(ctx, req.ClusterName)
+	access, err := cc.prov.Get(ctx, utils.ClusterName(req.Namespace, req.Name))
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("error getting cluster access: %w", err)
 	}
@@ -148,12 +166,20 @@ func (cc *ClusterController) reconcile(ctx context.Context, req mcreconcile.Requ
 
 		// content deletion logic is done, remove the access
 		log.Debug("Reconciling cluster access deletion")
-		res, err = cc.car.ReconcileDelete(ctx, standardRequestFromMulticlusterRequest(req))
+		res, err = cc.car.ReconcileDelete(ctx, req)
 		if err != nil {
 			return res, fmt.Errorf("error reconciling cluster access deletion: %w", err)
 		}
 		if res.RequeueAfter > 0 {
 			return res, nil
+		}
+
+		// remove finalizer
+		old := cl.DeepCopy()
+		if controllerutil.RemoveFinalizer(cl, utils.ClusterFinalizer(cc.providerName)) {
+			if err := cc.platformCluster.GetClient().Patch(ctx, cl, client.MergeFrom(old)); err != nil {
+				return reconcile.Result{}, fmt.Errorf("error removing finalizer from cluster '%s': %w", req.String(), err)
+			}
 		}
 
 		res, err = cc.callAfterDeletion(ctx, req)
@@ -162,9 +188,9 @@ func (cc *ClusterController) reconcile(ctx context.Context, req mcreconcile.Requ
 	return res, err
 }
 
-func (cc *ClusterController) SetupWithMulticlusterManager(mgr mcmanager.Manager) error {
-	return mcbuilder.ControllerManagedBy(mgr).
-		For(&clustersv1alpha1.Cluster{}, mcbuilder.WithPredicates(
+func (cc *ClusterController) SetupWithManager(mgr manager.Manager) error {
+	return builder.ControllerManagedBy(mgr).
+		For(&clustersv1alpha1.Cluster{}, builder.WithPredicates(
 			predicate.Or(
 				ctrlutils.OnCreatePredicate(),
 				ctrlutils.OnDeletePredicate(),
@@ -176,7 +202,7 @@ func (cc *ClusterController) SetupWithMulticlusterManager(mgr mcmanager.Manager)
 		Complete(cc)
 }
 
-func (cc *ClusterController) callIsResponsibleFor(ctx context.Context, req mcreconcile.Request, cluster *clustersv1alpha1.Cluster) bool {
+func (cc *ClusterController) callIsResponsibleFor(ctx context.Context, req reconcile.Request, cluster *clustersv1alpha1.Cluster) bool {
 	log := logging.FromContextOrPanic(ctx)
 	log.Debug("Start: IsResponsibleFor")
 	res := cc.Handler.IsResponsibleFor(logging.NewContext(ctx, log.WithName(LogNameIsResponsibleFor)), req, cc.platformCluster.GetClient(), cluster)
@@ -184,7 +210,7 @@ func (cc *ClusterController) callIsResponsibleFor(ctx context.Context, req mcrec
 	return res
 }
 
-func (cc *ClusterController) callHandleCreateOrUpdate(ctx context.Context, req mcreconcile.Request, cluster *clustersv1alpha1.Cluster, access cluster.Cluster) (reconcile.Result, error) {
+func (cc *ClusterController) callHandleCreateOrUpdate(ctx context.Context, req reconcile.Request, cluster *clustersv1alpha1.Cluster, access cluster.Cluster) (reconcile.Result, error) {
 	log := logging.FromContextOrPanic(ctx)
 	log.Debug("Start: HandleCreateOrUpdate")
 	res, err := cc.Handler.HandleCreateOrUpdate(logging.NewContext(ctx, log.WithName(LogNameHandleCreateOrUpdate)), req, cc.platformCluster.GetClient(), cluster, access)
@@ -192,7 +218,7 @@ func (cc *ClusterController) callHandleCreateOrUpdate(ctx context.Context, req m
 	return res, err
 }
 
-func (cc *ClusterController) callHandleDelete(ctx context.Context, req mcreconcile.Request, cluster *clustersv1alpha1.Cluster, access cluster.Cluster) (reconcile.Result, error) {
+func (cc *ClusterController) callHandleDelete(ctx context.Context, req reconcile.Request, cluster *clustersv1alpha1.Cluster, access cluster.Cluster) (reconcile.Result, error) {
 	log := logging.FromContextOrPanic(ctx)
 	log.Debug("Start: HandleDelete")
 	res, err := cc.Handler.HandleDelete(logging.NewContext(ctx, log.WithName(LogNameHandleDelete)), req, cc.platformCluster.GetClient(), cluster, access)
@@ -200,16 +226,10 @@ func (cc *ClusterController) callHandleDelete(ctx context.Context, req mcreconci
 	return res, err
 }
 
-func (cc *ClusterController) callAfterDeletion(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
+func (cc *ClusterController) callAfterDeletion(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := logging.FromContextOrPanic(ctx)
 	log.Debug("Start: AfterDeletion")
 	res, err := cc.Handler.AfterDeletion(logging.NewContext(ctx, log.WithName(LogNameAfterDeletion)), req, cc.platformCluster.GetClient())
 	log.Debug("End: AfterDeletion", "requeueAfter", res.RequeueAfter, "error", err)
 	return res, err
-}
-
-func standardRequestFromMulticlusterRequest(req mcreconcile.Request) reconcile.Request {
-	return reconcile.Request{
-		NamespacedName: req.NamespacedName,
-	}
 }

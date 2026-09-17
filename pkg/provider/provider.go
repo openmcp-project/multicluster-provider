@@ -30,7 +30,7 @@ import (
 	clustersv1alpha1 "github.com/openmcp-project/openmcp-operator/api/clusters/v1alpha1"
 	commonapi "github.com/openmcp-project/openmcp-operator/api/common"
 
-	clusterctrl "github.com/openmcp-project/multicluster-provider/pkg/cluster"
+	"github.com/openmcp-project/multicluster-provider/pkg/utils"
 )
 
 const (
@@ -73,7 +73,7 @@ type ClusterInstance struct {
 // scheme is the scheme which will be used for the clients retrieved from the provider
 // opts allows to set various options, most prominently, the label selector for AccessRequests which must be set, otherwise the provider will not engage any clusters.
 //
-// It is recommended to use NewWithClusterController instead, which will automatically wire the provider to a controller which creates the AccessRequests and allows to react to cluster lifecycle events.
+// It is recommended to use setup.NewWithClusterController instead, which will automatically wire the provider to a controller which creates the AccessRequests and allows to react to cluster lifecycle events.
 func New(platformCluster cluster.Cluster, scheme *runtime.Scheme, opts ...Option) *Provider {
 	p := &Provider{
 		opts:            &Options{},
@@ -90,26 +90,8 @@ func New(platformCluster cluster.Cluster, scheme *runtime.Scheme, opts ...Option
 	return p
 }
 
-// NewWithClusterController combines the creation of a new Provider with a controller managing AccessRequests for clusters, which is required for the provider to work anyway.
-// In addition, the cluster controller can also execute custom logic via the given handler.
-// The provider will automatically be configured with the correct label selector to watch AccessRequests created by the cluster controller.
-// DO NOT CHANGE THE LABEL SELECTOR, otherwise you risk breaking the wiring between provider and cluster controller.
-
-// Arguments:
-// - platformCluster: The cluster object for the platform cluster.
-// - providerName: This must be a k8s label value compliant string, and it must be unique across all operators using this library in the same platform cluster. It is recommended to use the PlatformService (or ServiceProvider)'s name for this.
-// - scheme: The scheme used for the clients retrieved from the provider.
-// - tokenConfig: The configuration for the kubeconfig token to be used for the AccessRequests created by the cluster controller.
-// - handler: A custom handler which will be called on cluster lifecycle events (engage/disengage). If not desired, putting in an empty cluster.Funcs{} struct works as a no-op handler.
-func NewWithClusterController(platformCluster cluster.Cluster, providerName string, scheme *runtime.Scheme, tokenConfig *clustersv1alpha1.TokenConfig, handler clusterctrl.ClusterHandler, opts ...Option) (*Provider, *clusterctrl.ClusterController) {
-	opts = append(opts, WithAccessRequestSelectors(clusterctrl.LabelSelectorForProvider(providerName)))
-	prov := New(platformCluster, scheme, opts...)
-	cctrl := clusterctrl.NewClusterController(platformCluster, handler, prov, providerName, tokenConfig)
-	return prov, cctrl
-}
-
 // SetupWithManager sets up the controller with the Manager.
-// It watches Cluster resources, but reacts to creation and deletion events only.
+// It watches AccessRequest resources, but reacts to creation and deletion events only.
 // It also watches Secrets which are owned by AccessRequests, here updates only. This is meant to requeue a Cluster when its kubeconfig token is rotated.
 func (p *Provider) SetupWithManager(mgr manager.Manager) error {
 	return builder.ControllerManagedBy(mgr).
@@ -169,9 +151,9 @@ func (p *Provider) SetupWithManager(mgr manager.Manager) error {
 func (p *Provider) Get(ctx context.Context, clusterName multicluster.ClusterName) (cluster.Cluster, error) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
-	if clusterName == HostingPlatformCluster {
+	if clusterName == utils.HostingPlatformCluster {
 		if p.hostingPlatformClusterRef != nil {
-			clusterName = ClusterNameFromReference(p.hostingPlatformClusterRef)
+			clusterName = utils.ClusterNameFromReference(p.hostingPlatformClusterRef)
 		} else {
 			return p.platformCluster, nil
 		}
@@ -190,7 +172,8 @@ func (p *Provider) IndexField(ctx context.Context, obj client.Object, field stri
 
 // Start implements [multicluster.ProviderRunnable].
 func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
-	log := logging.FromContextOrDiscard(ctx).WithName(ProviderName)
+	log, ctx := logging.FromContextOrNew(ctx, nil)
+	log = log.WithName(ProviderName)
 	log.Info("Starting provider")
 
 	p.lock.Lock()
@@ -235,7 +218,7 @@ func (p *Provider) reconcile(ctx context.Context, req reconcile.Request) (reconc
 	var ci *ClusterInstance
 	if isEngaged {
 		var err error
-		ci, err = p.clusters.GetTyped(ctx, ClusterNameFromReference(&cRef))
+		ci, err = p.clusters.GetTyped(ctx, utils.ClusterNameFromReference(&cRef))
 		if err != nil {
 			return reconcile.Result{}, fmt.Errorf("internal state inconsistency: AccessRequest in internal map, but corresponding cluster is not, this is not supposed to happen: %w", err)
 		}
@@ -257,8 +240,20 @@ func (p *Provider) reconcile(ctx context.Context, req reconcile.Request) (reconc
 			if isEngaged {
 				p.disengage(log, req)
 			}
+			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, fmt.Errorf("unable to get resource '%s' from cluster: %w", req.String(), err)
+	}
+
+	// check AccessRequest labels
+	if !p.opts.MatchesAnyAccessRequestSelector(ar) {
+		if isEngaged {
+			log.Info("Disengaging cluster because AccessRequest does not match the selector(s) anymore")
+			p.disengage(log, req)
+		} else {
+			log.Debug("Ignoring AccessRequest because it does not match the selector(s)")
+		}
+		return reconcile.Result{}, nil
 	}
 
 	if ar.Status.Phase != clustersv1alpha1.REQUEST_GRANTED {
@@ -270,6 +265,7 @@ func (p *Provider) reconcile(ctx context.Context, req reconcile.Request) (reconc
 	if ar.Spec.ClusterRef == nil {
 		return reconcile.Result{}, fmt.Errorf("AccessRequest '%s' is granted, but does not have a cluster reference", req.String())
 	}
+	cRef = *ar.Spec.ClusterRef
 
 	log.Debug("Fetching referenced Cluster for metadata")
 	clu := &clustersv1alpha1.Cluster{}
@@ -330,7 +326,9 @@ func (p *Provider) reconcile(ctx context.Context, req reconcile.Request) (reconc
 	}
 
 	p.accessRequests[req] = cRef
-	if err := p.clusters.AddOrReplace(ctx, ClusterNameFromReference(&cRef), ci, p.mcAware); err != nil {
+	if err := p.clusters.AddOrReplace(ctx, utils.ClusterNameFromReference(&cRef), ci, p.mcAware); err != nil {
+		// any error returned by AddOrReplace comes from an Add operation, so we can safely remove the access request from the map if that failed
+		delete(p.accessRequests, req)
 		return reconcile.Result{}, fmt.Errorf("failed to engage cluster '%s/%s': %w", cRef.Namespace, cRef.Name, err)
 	}
 	log.Debug("Cluster successfully engaged")
@@ -358,7 +356,7 @@ func (p *Provider) disengage(log logging.Logger, arReq reconcile.Request) {
 		return
 	}
 
-	p.clusters.Remove(ClusterNameFromReference(&cRef))
+	p.clusters.Remove(utils.ClusterNameFromReference(&cRef))
 	delete(p.accessRequests, arReq)
 	if p.hostingPlatformClusterRef != nil && p.hostingPlatformClusterRef.Namespace == cRef.Namespace && p.hostingPlatformClusterRef.Name == cRef.Name {
 		log.Info("Hosting platform cluster has been disengaged")
