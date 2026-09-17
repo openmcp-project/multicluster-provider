@@ -114,7 +114,7 @@ func (cc *ClusterController) reconcile(ctx context.Context, req reconcile.Reques
 	isResponsible := cc.callIsResponsibleFor(ctx, req, cl)
 	if !isResponsible {
 		// somewhat ugly, but not possible any other way
-		_, err := cc.car.AccessRequest(ctx, standardRequestFromMulticlusterRequest(req), clusterKey)
+		_, err := cc.car.AccessRequest(ctx, req, clusterKey)
 		if apierrors.IsNotFound(err) {
 			// There is no AccessRequest for this Cluster, so it was not handled before (or has already been 'unhandled'), so we do nothing.
 			log.Debug("No AccessRequest found for cluster, nothing to do except for making sure that the finalizer is gone")
@@ -139,7 +139,7 @@ func (cc *ClusterController) reconcile(ctx context.Context, req reconcile.Reques
 	}
 
 	log.Debug("Reconciling cluster access")
-	res, err := cc.car.Reconcile(ctx, standardRequestFromMulticlusterRequest(req))
+	res, err := cc.car.Reconcile(ctx, req)
 	if err != nil {
 		return res, fmt.Errorf("error reconciling cluster access: %w", err)
 	}
@@ -166,7 +166,7 @@ func (cc *ClusterController) reconcile(ctx context.Context, req reconcile.Reques
 
 		// content deletion logic is done, remove the access
 		log.Debug("Reconciling cluster access deletion")
-		res, err = cc.car.ReconcileDelete(ctx, standardRequestFromMulticlusterRequest(req))
+		res, err = cc.car.ReconcileDelete(ctx, req)
 		if err != nil {
 			return res, fmt.Errorf("error reconciling cluster access deletion: %w", err)
 		}
@@ -232,10 +232,4 @@ func (cc *ClusterController) callAfterDeletion(ctx context.Context, req reconcil
 	res, err := cc.Handler.AfterDeletion(logging.NewContext(ctx, log.WithName(LogNameAfterDeletion)), req, cc.platformCluster.GetClient())
 	log.Debug("End: AfterDeletion", "requeueAfter", res.RequeueAfter, "error", err)
 	return res, err
-}
-
-func standardRequestFromMulticlusterRequest(req reconcile.Request) reconcile.Request {
-	return reconcile.Request{
-		NamespacedName: req.NamespacedName,
-	}
 }
