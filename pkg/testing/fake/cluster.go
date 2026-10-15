@@ -7,13 +7,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/recorder"
 )
 
 var _ cluster.Cluster = &Cluster{}
@@ -78,6 +78,6 @@ func (c *Cluster) GetEventRecorderFor(name string) record.EventRecorder {
 }
 
 // GetEventRecorder satisfies recorder.Provider.
-func (c *Cluster) GetEventRecorder(name string) events.EventRecorder {
+func (c *Cluster) GetEventRecorder(name string) recorder.EventRecorder {
 	return record.NewEventRecorderAdapter(record.NewFakeRecorder(100))
 }
