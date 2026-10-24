@@ -1,6 +1,6 @@
 module github.com/openmcp-project/multicluster-provider
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/openmcp-project/controller-utils v0.33.3
